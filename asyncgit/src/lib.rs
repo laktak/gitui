@@ -80,7 +80,7 @@ pub use crate::{
 	revlog::{AsyncLog, FetchStatus},
 	status::{AsyncStatus, StatusParams},
 	sync::{
-		diff::{DiffLine, DiffLineType, FileDiff},
+		diff::{DiffLine, DiffLineType, FileDiff, InlineHighlight},
 		remotes::push::PushType,
 		status::{StatusItem, StatusItemType},
 	},

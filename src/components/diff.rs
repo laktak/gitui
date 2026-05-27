@@ -18,7 +18,7 @@ use anyhow::Result;
 use asyncgit::{
 	hash,
 	sync::{self, diff::DiffLinePosition, RepoPathRef},
-	DiffLine, DiffLineType, FileDiff,
+	DiffLine, DiffLineType, FileDiff, InlineHighlight,
 };
 use bytesize::ByteSize;
 use crossterm::event::Event;
@@ -30,6 +30,114 @@ use ratatui::{
 	Frame,
 };
 use std::{borrow::Cow, cell::Cell, cmp, path::Path};
+
+/// Split `raw` (the original `DiffLine::content`, before any tab expansion or
+/// scroll trimming) into styled spans using pre-computed word-level highlight
+/// byte ranges, then apply `tabs_to_spaces` **per segment** so that
+/// tab-expansion never shifts the highlight offsets.
+///
+/// `scrolled_right` and `pad_width` are applied after reassembly, on the
+/// already-segmented text, so they cannot corrupt the ranges either.
+fn build_inline_spans(
+	raw: &str,
+	highlights: &[InlineHighlight],
+	line_type: DiffLineType,
+	selected: bool,
+	scrolled_right: usize,
+	pad_width: usize,
+	theme: &SharedTheme,
+) -> Vec<Span<'static>> {
+	let normal = theme.diff_line(line_type, selected);
+	let highlighted = theme.diff_line_highlight(line_type, selected);
+	let len = raw.len();
+
+	// Step 1: split raw content into (text, is_highlighted) segments using
+	// byte ranges that were computed on this same raw string.
+	let mut raw_segs: Vec<(String, bool)> = Vec::new();
+	let mut cursor = 0usize;
+	for hl in highlights {
+		let start = hl.start.min(len);
+		let end = hl.end.min(len);
+		if start > cursor {
+			raw_segs.push((raw[cursor..start].to_owned(), false));
+		}
+		if end > start {
+			raw_segs.push((raw[start..end].to_owned(), true));
+		}
+		cursor = end;
+	}
+	if cursor < len {
+		raw_segs.push((raw[cursor..].to_owned(), false));
+	}
+
+	// Step 2: apply tab expansion to each segment independently so that
+	// a tab inside one segment does not displace offsets in later segments.
+	let expanded: Vec<(String, bool)> =
+		raw_segs.into_iter().map(|(t, hl)| (tabs_to_spaces(t), hl)).collect();
+
+	// Step 3: reassemble into one string, apply scroll trim and width padding,
+	// then re-slice back into styled spans.
+	let joined: String =
+		expanded.iter().map(|(s, _)| s.as_str()).collect();
+	let trimmed = trim_offset(&joined, scrolled_right);
+	let trim_byte = joined.len() - trimmed.len();
+
+	let padded = if selected {
+		format!("{trimmed:pad_width$}\n")
+	} else {
+		format!("{trimmed}\n")
+	};
+
+	// Step 4: walk the expanded segments, skipping bytes before trim_byte,
+	// and produce one Span per visible segment.
+	let mut spans: Vec<Span<'static>> = Vec::new();
+	let mut byte_pos = 0usize;
+	let padded_len = padded.len();
+	let mut consumed = 0usize; // bytes of `padded` assigned so far
+
+	for (idx, (text, is_hl)) in expanded.iter().enumerate() {
+		let seg_start = byte_pos;
+		let seg_end = byte_pos + text.len();
+		byte_pos = seg_end;
+
+		let vis_start = seg_start.max(trim_byte);
+		if vis_start >= seg_end {
+			// Entire segment is scrolled out of view
+			continue;
+		}
+
+		// Offset into `text` where the visible part begins
+		let text_start = vis_start - seg_start;
+		let visible_in_seg = &text[text_start..];
+
+		// Map to the corresponding slice of `padded` (which may include padding
+		// and trailing newline appended after the last segment).
+		let is_last = idx == expanded.len() - 1;
+		let span_text = if is_last {
+			// Give this segment the rest of `padded` (includes pad + "\n")
+			padded[consumed..].to_owned()
+		} else {
+			let end_in_padded = consumed + visible_in_seg.len();
+			let s = padded[consumed..end_in_padded.min(padded_len)].to_owned();
+			consumed += visible_in_seg.len();
+			s
+		};
+
+		if span_text.is_empty() {
+			continue;
+		}
+
+		let style = if *is_hl { highlighted } else { normal };
+		spans.push(Span::styled(span_text, style));
+	}
+
+	if spans.is_empty() {
+		// Fully scrolled away — emit a bare newline with normal style
+		spans.push(Span::styled("\n".to_owned(), normal));
+	}
+
+	spans
+}
 
 #[derive(Default)]
 struct Current {
@@ -461,12 +569,36 @@ impl DiffComponent {
 		let content = trim_offset(&content, scrolled_right);
 
 		let filled = if selected {
-			// selected line
 			format!("{content:w$}\n", w = width as usize)
 		} else {
-			// weird eof missing eol line
 			format!("{content}\n")
 		};
+
+		// When the line carries word-level highlight ranges, emit one span
+		// per segment so changed words are visually distinguished.
+		// Pass the raw content (before tab expansion / scroll trim) so that
+		// the pre-computed byte offsets remain valid.
+		if !line.inline_highlights.is_empty() {
+			let raw = if !is_content_line
+				&& line.content.as_ref().is_empty()
+			{
+				theme.line_break()
+			} else {
+				line.content.as_ref().to_string()
+			};
+			let spans = build_inline_spans(
+				&raw,
+				&line.inline_highlights,
+				line.line_type,
+				selected,
+				scrolled_right,
+				width as usize,
+				theme,
+			);
+			let mut result = vec![left_side_of_line];
+			result.extend(spans);
+			return Line::from(result);
+		}
 
 		Line::from(vec![
 			left_side_of_line,
@@ -977,6 +1109,7 @@ mod tests {
 			content: "".into(),
 			line_type: DiffLineType::Add,
 			position: Default::default(),
+			inline_highlights: Vec::new(),
 		};
 
 		{

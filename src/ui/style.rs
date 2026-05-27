@@ -9,6 +9,13 @@ use struct_patch::Patch;
 
 pub type SharedTheme = Rc<Theme>;
 
+/// Foreground + background colour pair for word-level diff highlighting.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WordHighlightStyle {
+	pub fg: Color,
+	pub bg: Color,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Patch)]
 #[patch(attribute(derive(Serialize, Deserialize)))]
 pub struct Theme {
@@ -21,6 +28,10 @@ pub struct Theme {
 	disabled_fg: Color,
 	diff_line_add: Color,
 	diff_line_delete: Color,
+	/// Word-level highlight style for added words in a diff line
+	diff_word_add: WordHighlightStyle,
+	/// Word-level highlight style for deleted words in a diff line
+	diff_word_delete: WordHighlightStyle,
 	diff_file_added: Color,
 	diff_file_removed: Color,
 	diff_file_moved: Color,
@@ -202,6 +213,24 @@ impl Theme {
 		self.apply_select(style, selected)
 	}
 
+	/// Style for a word-level changed token on an Add or Delete line.
+	/// Uses the theme colours `diff_word_add` / `diff_word_delete` so the user
+	/// can configure background and foreground independently.
+	pub fn diff_line_highlight(
+		&self,
+		typ: DiffLineType,
+		selected: bool,
+	) -> Style {
+		let wh = match typ {
+			DiffLineType::Add => &self.diff_word_add,
+			DiffLineType::Delete => &self.diff_word_delete,
+			// Context / header lines are never word-highlighted;
+			// fall back to the line style so nothing breaks.
+			_ => return self.diff_line(typ, selected),
+		};
+		Style::default().fg(wh.fg).bg(wh.bg)
+	}
+
 	pub fn text_danger(&self) -> Style {
 		Style::default().fg(self.danger_fg)
 	}
@@ -339,6 +368,14 @@ impl Default for Theme {
 			disabled_fg: Color::DarkGray,
 			diff_line_add: Color::Green,
 			diff_line_delete: Color::Red,
+			diff_word_add: WordHighlightStyle {
+				fg: Color::DarkGray,
+				bg: Color::Green,
+			},
+			diff_word_delete: WordHighlightStyle {
+				fg: Color::White,
+				bg: Color::Red,
+			},
 			diff_file_added: Color::LightGreen,
 			diff_file_removed: Color::LightRed,
 			diff_file_moved: Color::LightMagenta,

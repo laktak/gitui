@@ -1,4 +1,7 @@
 //! sync git api for fetching a diff
+//!
+//! Inline word-level highlighting is computed via the `similar` crate
+//! by pairing consecutive Delete/Add lines within each hunk.
 
 use super::{
 	commit_files::{
@@ -19,6 +22,7 @@ use git2::{
 };
 use scopetime::scope_time;
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 use std::{cell::RefCell, fs, path::Path, rc::Rc};
 
 /// type of diff of a single line
@@ -48,6 +52,16 @@ impl From<git2::DiffLineType> for DiffLineType {
 	}
 }
 
+/// A byte range [start, end) within a `DiffLine`'s content that was changed.
+/// Used to highlight individual changed words on Add/Delete lines.
+#[derive(Clone, Hash, Debug, PartialEq, Eq)]
+pub struct InlineHighlight {
+	/// Byte offset of the start of the changed token (inclusive)
+	pub start: usize,
+	/// Byte offset of the end of the changed token (exclusive)
+	pub end: usize,
+}
+
 ///
 #[derive(Default, Clone, Hash, Debug)]
 pub struct DiffLine {
@@ -57,6 +71,9 @@ pub struct DiffLine {
 	pub line_type: DiffLineType,
 	///
 	pub position: DiffLinePosition,
+	/// Word-level highlighted byte ranges within `content`.
+	/// Non-empty only for Add/Delete lines that have a paired counterpart.
+	pub inline_highlights: Vec<InlineHighlight>,
 }
 
 ///
@@ -309,6 +326,7 @@ fn raw_diff_to_file_diff(
 						.trim_matches(is_newline)
 						.into(),
 					line_type: line.origin_value().into(),
+					inline_highlights: Vec::new(),
 				};
 
 				current_lines.push(diff_line);
@@ -386,13 +404,224 @@ fn raw_diff_to_file_diff(
 			res.borrow_mut().untracked = true;
 		}
 	}
-	let res = Rc::try_unwrap(res)
-		.map_err(|_| Error::Generic("rc unwrap error".to_owned()))?;
-	Ok(res.into_inner())
+	let mut result = Rc::try_unwrap(res)
+		.map_err(|_| Error::Generic("rc unwrap error".to_owned()))?
+		.into_inner();
+
+	for hunk in &mut result.hunks {
+		add_inline_highlights(&mut hunk.lines);
+	}
+
+	Ok(result)
 }
 
 const fn is_newline(c: char) -> bool {
 	c == '\n' || c == '\r'
+}
+
+/// For each contiguous group of Delete lines followed immediately by Add lines
+/// in a hunk, compute word-level highlights using `similar`.
+///
+/// Rules:
+/// - If the group has **equal** numbers of deletes and adds (N:N), pair each
+///   Delete with the corresponding Add (first-to-first, etc.) and annotate
+///   both with changed-word byte ranges.
+/// - If the counts differ (N:M where N≠M), pair them using a greedy best-match
+///   similarity algorithm (requiring similarity ratio >= 0.5) so that similar
+///   lines are still highlighted, while completely different lines are skipped.
+fn add_inline_highlights(lines: &mut [DiffLine]) {
+	let mut i = 0;
+	while i < lines.len() {
+		// Only enter a group at a Delete line
+		if lines[i].line_type != DiffLineType::Delete {
+			i += 1;
+			continue;
+		}
+
+		// Collect the full run of consecutive Deletes
+		let del_start = i;
+		while i < lines.len() && lines[i].line_type == DiffLineType::Delete {
+			i += 1;
+		}
+		let n_del = i - del_start;
+
+		// Collect the full run of consecutive Adds immediately following
+		let add_start = i;
+		while i < lines.len() && lines[i].line_type == DiffLineType::Add {
+			i += 1;
+		}
+		let n_add = i - add_start;
+
+		// Only annotate when we have both deletes and adds
+		if n_del == 0 || n_add == 0 {
+			continue;
+		}
+
+		if n_del == n_add {
+			for k in 0..n_del {
+				compute_pair_highlights(lines, del_start + k, add_start + k);
+			}
+		} else {
+			// For N:M (where N != M), pair lines using greedy similarity matching.
+			let mut candidates = Vec::new();
+			for d_idx in del_start..add_start {
+				for a_idx in add_start..i {
+					let ratio = calculate_similarity_ratio(
+						lines[d_idx].content.as_ref(),
+						lines[a_idx].content.as_ref(),
+					);
+					if ratio >= 0.5 {
+						candidates.push((ratio, d_idx, a_idx));
+					}
+				}
+			}
+
+			// Sort candidates by ratio in descending order.
+			candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+			let mut paired_d = vec![false; n_del];
+			let mut paired_a = vec![false; n_add];
+
+			for (_, d_idx, a_idx) in candidates {
+				let d_offset = d_idx - del_start;
+				let a_offset = a_idx - add_start;
+				if !paired_d[d_offset] && !paired_a[a_offset] {
+					compute_pair_highlights(lines, d_idx, a_idx);
+					paired_d[d_offset] = true;
+					paired_a[a_offset] = true;
+				}
+			}
+		}
+	}
+}
+
+fn calculate_similarity_ratio(old: &str, new: &str) -> f64 {
+	let old_tokens = tokenize_code(old);
+	let new_tokens = tokenize_code(new);
+	let diff = TextDiff::from_slices(&old_tokens, &new_tokens);
+	let mut equal_len = 0;
+	for change in diff.iter_all_changes() {
+		if change.tag() == ChangeTag::Equal {
+			equal_len += change.value().len();
+		}
+	}
+	let total_len = old.len() + new.len();
+	if total_len == 0 {
+		1.0
+	} else {
+		(2.0 * equal_len as f64) / (total_len as f64)
+	}
+}
+
+/// Compute word-level diff between `lines[del_idx]` (Delete) and
+/// `lines[add_idx]` (Add) and store the resulting byte ranges in each.
+fn compute_pair_highlights(lines: &mut [DiffLine], del_idx: usize, add_idx: usize) {
+	let old_content = lines[del_idx].content.clone();
+	let new_content = lines[add_idx].content.clone();
+
+	let old_tokens = tokenize_code(old_content.as_ref());
+	let new_tokens = tokenize_code(new_content.as_ref());
+	let diff = TextDiff::from_slices(&old_tokens, &new_tokens);
+
+	let mut del_highlights: Vec<InlineHighlight> = Vec::new();
+	let mut add_highlights: Vec<InlineHighlight> = Vec::new();
+	let mut del_offset: usize = 0;
+	let mut add_offset: usize = 0;
+
+	for change in diff.iter_all_changes() {
+		let token: &str = change.value();
+		let len = token.len();
+		match change.tag() {
+			ChangeTag::Delete => {
+				del_highlights.push(InlineHighlight {
+					start: del_offset,
+					end: del_offset + len,
+				});
+				del_offset += len;
+			}
+			ChangeTag::Insert => {
+				add_highlights.push(InlineHighlight {
+					start: add_offset,
+					end: add_offset + len,
+				});
+				add_offset += len;
+			}
+			ChangeTag::Equal => {
+				del_offset += len;
+				add_offset += len;
+			}
+		}
+	}
+
+	merge_whitespace_separated_highlights(&mut del_highlights, old_content.as_ref());
+	merge_whitespace_separated_highlights(&mut add_highlights, new_content.as_ref());
+
+	lines[del_idx].inline_highlights = del_highlights;
+	lines[add_idx].inline_highlights = add_highlights;
+}
+
+fn tokenize_code(s: &str) -> Vec<&str> {
+	let mut tokens = Vec::new();
+	let mut chars = s.char_indices().peekable();
+
+	while let Some(&(start_idx, c)) = chars.peek() {
+		if c.is_alphanumeric() || c == '_' {
+			chars.next();
+			while let Some(&(end_idx, next_c)) = chars.peek() {
+				if next_c.is_alphanumeric() || next_c == '_' {
+					chars.next();
+				} else {
+					tokens.push(&s[start_idx..end_idx]);
+					break;
+				}
+			}
+			if chars.peek().is_none() {
+				tokens.push(&s[start_idx..]);
+			}
+		} else if c.is_whitespace() {
+			chars.next();
+			while let Some(&(end_idx, next_c)) = chars.peek() {
+				if next_c.is_whitespace() {
+					chars.next();
+				} else {
+					tokens.push(&s[start_idx..end_idx]);
+					break;
+				}
+			}
+			if chars.peek().is_none() {
+				tokens.push(&s[start_idx..]);
+			}
+		} else {
+			chars.next();
+			if let Some(&(end_idx, _)) = chars.peek() {
+				tokens.push(&s[start_idx..end_idx]);
+			} else {
+				tokens.push(&s[start_idx..]);
+			}
+		}
+	}
+	tokens
+}
+
+fn merge_whitespace_separated_highlights(highlights: &mut Vec<InlineHighlight>, content: &str) {
+	if highlights.len() <= 1 {
+		return;
+	}
+
+	let mut merged: Vec<InlineHighlight> = Vec::new();
+	for h in highlights.drain(..) {
+		if let Some(last) = merged.last_mut() {
+			let between = &content[last.end..h.start];
+			if last.end == h.start || (!between.is_empty() && between.chars().all(|c| c.is_whitespace())) {
+				last.end = h.end;
+			} else {
+				merged.push(h);
+			}
+		} else {
+			merged.push(h);
+		}
+	}
+	*highlights = merged;
 }
 
 fn new_file_content(path: &Path) -> Option<Vec<u8>> {
@@ -665,5 +894,131 @@ mod tests {
 		assert_eq!(diff.size_delta, 1);
 
 		Ok(())
+	}
+
+	#[test]
+	fn test_add_inline_highlights_pairing() {
+		use super::{add_inline_highlights, DiffLine, DiffLineType, DiffLinePosition};
+
+		// Case 1: 1 Delete vs 2 Adds where one Add is very similar.
+		let mut lines = vec![
+			DiffLine {
+				content: "// printToolCallLine prints a single line describing the tool call.".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "// printToolCallLine prints a tool call line WITHOUT a trailing newline so that".into(),
+				line_type: DiffLineType::Add,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "// printToolCallDone can append elapsed time on the same line.".into(),
+				line_type: DiffLineType::Add,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+		];
+
+		add_inline_highlights(&mut lines);
+
+		// The delete line and the first add line should be paired and have inline highlights.
+		assert!(!lines[0].inline_highlights.is_empty());
+		assert!(!lines[1].inline_highlights.is_empty());
+		// The second add line is dissimilar and should have no inline highlights.
+		assert!(lines[2].inline_highlights.is_empty());
+
+		// Case 2: 4 Deletes vs 1 Add (completely different).
+		// None should be highlighted.
+		let mut lines2 = vec![
+			DiffLine {
+				content: "err := huh.NewInput().".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "Prompt(\"fai> \").".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "Value(&input).".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "Run()".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "fmt.Print(fai.AnsiCyan + fai.AnsiBold + \"fai> \" + fai.AnsiReset)".into(),
+				line_type: DiffLineType::Add,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+		];
+
+		add_inline_highlights(&mut lines2);
+		assert!(lines2.iter().all(|l| l.inline_highlights.is_empty()));
+
+		// Case 3: Whitespace between two word diff colored tokens should be merged.
+		let mut lines3 = vec![
+			DiffLine {
+				content: "foo bar".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "baz qux".into(),
+				line_type: DiffLineType::Add,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+		];
+
+		add_inline_highlights(&mut lines3);
+
+		// They should have exactly 1 highlight range that spans the entire content.
+		assert_eq!(lines3[0].inline_highlights.len(), 1);
+		assert_eq!(lines3[0].inline_highlights[0].start, 0);
+		assert_eq!(lines3[0].inline_highlights[0].end, 7);
+
+		assert_eq!(lines3[1].inline_highlights.len(), 1);
+		assert_eq!(lines3[1].inline_highlights[0].start, 0);
+		assert_eq!(lines3[1].inline_highlights[0].end, 7);
+
+		// Case 4: Non-whitespace separated tokens should be tokenized fine-grained.
+		let mut lines4 = vec![
+			DiffLine {
+				content: "artifactVersion=1".into(),
+				line_type: DiffLineType::Delete,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+			DiffLine {
+				content: "artifactVersion=2".into(),
+				line_type: DiffLineType::Add,
+				position: DiffLinePosition::default(),
+				inline_highlights: Vec::new(),
+			},
+		];
+
+		add_inline_highlights(&mut lines4);
+
+		assert_eq!(lines4[0].inline_highlights.len(), 1);
+		assert_eq!(lines4[0].inline_highlights[0].start, 16);
+		assert_eq!(lines4[0].inline_highlights[0].end, 17);
+
+		assert_eq!(lines4[1].inline_highlights.len(), 1);
+		assert_eq!(lines4[1].inline_highlights[0].start, 16);
+		assert_eq!(lines4[1].inline_highlights[0].end, 17);
 	}
 }

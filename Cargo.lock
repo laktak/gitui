@@ -168,6 +168,7 @@ dependencies = [
  "scopetime",
  "serde",
  "serial_test",
+ "similar",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.18",

@@ -88,3 +88,24 @@ This can be changed by specifying the `use_selection_fg` boolean in your `theme.
 ```
 
 By default, `use_selection_fg` is set to `true`.
+
+## Customizing word-level diff highlights
+
+Word-level highlights for additions and deletions within a diff line can be configured using `diff_word_add` and `diff_word_delete`. Each takes a foreground (`fg`) and background (`bg`) color:
+
+```ron
+(
+    diff_word_add: Some((
+        fg: "Yellow",
+        bg: "#004d00",
+    )),
+    diff_word_delete: Some((
+        fg: "White",
+        bg: "#600000",
+    )),
+)
+```
+
+By default:
+* `diff_word_add` uses `fg: DarkGray` and `bg: Green`.
+* `diff_word_delete` uses `fg: White` and `bg: Red`.
